@@ -3,9 +3,3 @@ dist/
 *.log
 .DS_Store
 
-# Local-only files
-Week-1-Projects-1.pdf
-ponytail.md
-unslop.md
-PROMPTS.md
-REQUIREMENTS.md
