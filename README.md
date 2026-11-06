@@ -21,6 +21,8 @@ PDF Studio processes documents locally in the browser. Files are not uploaded to
 - Node.js 18 or newer
 - npm
 
+See [REQUIREMENTS.md](REQUIREMENTS.md) for the complete functional requirements and acceptance criteria. Development prompt history is documented in [PROMPTS.md](PROMPTS.md).
+
 ## Run locally
 
 ```bash
