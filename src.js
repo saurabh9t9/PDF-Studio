@@ -20,18 +20,18 @@ app.innerHTML = `
   </header>
   <main>
     <section class="hero" id="hero">
-      <input id="fileInput" type="file" accept="application/pdf,.pdf,image/png,image/jpeg,image/webp" multiple hidden>
+      <input id="fileInput" type="file" accept="application/pdf,.pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,.docx,image/png,image/jpeg,image/webp" multiple hidden>
       <div class="upload-icon">PDF</div>
       <h1>Organise your PDF</h1>
       <p>Your files stay on this computer. No upload, account, or internet connection.</p>
-      <button class="primary" id="chooseFiles">Choose PDF or image files</button>
-      <small>or drop PDF or image files here</small>
+      <button class="primary" id="chooseFiles">Choose files</button>
+      <small>PDF, DOCX, PNG, JPG, or WebP files — or drop them here</small>
     </section>
 
     <section class="workspace hidden" id="workspace">
       <div class="files-row">
         <div><h2>Pages</h2><p id="summary">0 pages</p></div>
-        <div class="file-actions"><button class="ghost" id="selectAllPages">Select all</button><button class="primary" id="downloadPdf">Download</button><button class="ghost" id="addFiles">Add PDFs</button><button class="ghost" id="clearFiles">Clear all</button></div>
+        <div class="file-actions"><button class="ghost" id="selectAllPages">Select all</button><button class="primary" id="downloadPdf">Download</button><button class="ghost" id="addFiles">Add files</button><button class="ghost" id="clearFiles">Clear all</button></div>
       </div>
       <div class="toolbar">
         <button data-action="merge">Merge selected</button><button data-action="split">Split selected</button><button data-action="rotate-left">Rotate left</button><button data-action="rotate-right">Rotate right</button>
@@ -41,6 +41,23 @@ app.innerHTML = `
         <button id="compressPdf">Compress</button><button id="editDetails">Edit details</button><button id="removeDetails">Remove details</button><button id="comparePdf">Compare PDFs</button>
       </div>
       <div id="pages" class="pages"></div>
+    </section>
+    <section id="importProgress" class="import-progress hidden" aria-live="polite" aria-busy="true">
+      <div class="import-progress-heading">
+        <div class="import-heading-copy"><span class="import-kicker">PDF STUDIO · LOCAL IMPORT</span><strong>Review upload order</strong><span>Files import one at a time in this order</span></div>
+        <span id="importCount" class="import-count">0 / 0</span>
+      </div>
+      <div id="importFiles" class="import-files"></div>
+      <button id="startImport" class="primary import-start">Start import</button>
+    </section>
+    <section id="downloadProgress" class="download-progress hidden" aria-live="polite">
+      <div class="download-progress-heading">
+        <div class="download-progress-copy"><span class="import-kicker">PDF STUDIO · DOWNLOAD</span><strong id="downloadProgressTitle">Preparing download</strong><span id="downloadProgressDetail"></span></div>
+        <span id="downloadProgressValue" class="download-progress-value">Preparing</span>
+      </div>
+      <div id="downloadProgressTrack" class="download-progress-track" role="progressbar" aria-label="Download preparation progress" aria-valuemin="0" aria-valuemax="100" aria-valuetext="Preparing download">
+        <span id="downloadProgressFill" class="download-progress-fill is-indeterminate"></span>
+      </div>
     </section>
   </main>
   <input id="imagePdfInput" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden>
@@ -93,46 +110,256 @@ const fileInput = document.querySelector('#fileInput');
 const hero = document.querySelector('#hero');
 const workspace = document.querySelector('#workspace');
 const pagesElement = document.querySelector('#pages');
+const importProgress = document.querySelector('#importProgress');
+const importFilesElement = document.querySelector('#importFiles');
+const importCount = document.querySelector('#importCount');
+const startImportButton = document.querySelector('#startImport');
+const downloadProgress = document.querySelector('#downloadProgress');
+const downloadProgressTitle = document.querySelector('#downloadProgressTitle');
+const downloadProgressDetail = document.querySelector('#downloadProgressDetail');
+const downloadProgressValue = document.querySelector('#downloadProgressValue');
+const downloadProgressTrack = document.querySelector('#downloadProgressTrack');
+const downloadProgressFill = document.querySelector('#downloadProgressFill');
+let importQueue = [];
+let importTask = Promise.resolve();
+let startImport;
+let downloadHideTimer;
 
-function showToast(message) {
+function queueFiles(files) {
+  const selection = Array.from(files);
+  const nextImport = importTask.then(
+    () => loadFiles(selection),
+    () => loadFiles(selection)
+  );
+  importTask = nextImport.catch(error => {
+    console.error('Could not import the selected files.', error);
+    showToast('Could not import the selected files.');
+  });
+  return importTask;
+}
+
+function animateImportPanel() {
+  const gsap = window.gsap;
+  if (!gsap || window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  gsap.fromTo(importProgress, { autoAlpha: 0, y: 22, scale: 0.97 }, {
+    autoAlpha: 1, y: 0, scale: 1, duration: 0.42, ease: 'power3.out'
+  });
+  gsap.fromTo(importFilesElement.children, { autoAlpha: 0, x: 16 }, {
+    autoAlpha: 1, x: 0, duration: 0.32, stagger: 0.07, delay: 0.12, ease: 'power2.out'
+  });
+}
+
+function renderImportQueue(files) {
+  importQueue = [...files].map(file => ({
+    file,
+    name: file.name,
+    status: 'waiting',
+    detail: 'Waiting in selection order',
+    percent: 0
+  }));
+  importCount.textContent = `0 / ${importQueue.length}`;
+  importFilesElement.innerHTML = importQueue.map((file, index) => {
+    const extension = file.name.split('.').pop()?.slice(0, 4).toUpperCase() || 'FILE';
+    return `<article class="import-file" data-import-file="${index}">
+      <span class="import-file-icon">${escapeHtml(extension)}</span>
+      <div class="import-file-content">
+        <div class="import-file-label"><strong title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</strong><span data-import-percent>Queued</span></div>
+        <div class="import-file-track"><span class="import-file-fill" data-import-fill></span></div>
+        <span class="import-file-detail" data-import-detail>${file.detail}</span>
+      </div>
+      <div class="import-file-actions">
+        <button type="button" class="import-order-button" data-move-import="-1" aria-label="Move ${escapeHtml(file.name)} up" ${index === 0 ? 'disabled' : ''}>↑</button>
+        <button type="button" class="import-order-button" data-move-import="1" aria-label="Move ${escapeHtml(file.name)} down" ${index === importQueue.length - 1 ? 'disabled' : ''}>↓</button>
+        <span class="import-file-state" data-import-state aria-hidden="true"></span>
+      </div>
+    </article>`;
+  }).join('');
+  importProgress.classList.remove('hidden');
+  animateImportPanel();
+}
+
+function moveImportFile(index, direction) {
+  const nextIndex = index + direction;
+  if (nextIndex < 0 || nextIndex >= importQueue.length) return;
+  [importQueue[index], importQueue[nextIndex]] = [importQueue[nextIndex], importQueue[index]];
+  const row = importFilesElement.children[index];
+  const nextRow = importFilesElement.children[nextIndex];
+  if (direction < 0) importFilesElement.insertBefore(row, nextRow);
+  else importFilesElement.insertBefore(nextRow, row);
+  [...importFilesElement.children].forEach((item, position) => {
+    item.dataset.importFile = position;
+    item.querySelector('[data-move-import="-1"]').disabled = position === 0;
+    item.querySelector('[data-move-import="1"]').disabled = position === importQueue.length - 1;
+  });
+}
+
+function updateImportFile(index, status, detail, percent = null) {
+  const file = importQueue[index];
+  if (!file) return;
+  file.status = status;
+  file.detail = detail;
+  if (percent !== null) file.percent = Math.min(100, Math.max(0, percent));
+
+  const row = importFilesElement.querySelector(`[data-import-file="${index}"]`);
+  if (!row) return;
+  row.dataset.state = status;
+  row.querySelector('[data-import-detail]').textContent = detail;
+  row.querySelector('[data-import-percent]').textContent =
+    status === 'complete' ? '100%' : status === 'error' ? 'Failed' :
+      status === 'uploading' && percent !== null ? `${file.percent}%` :
+        status === 'converting' ? 'Converting' : status === 'processing' ? 'Preparing' : 'Queued';
+  row.querySelector('[data-import-state]').textContent =
+    status === 'complete' ? '✓' : status === 'error' ? '!' : '';
+
+  const fill = row.querySelector('[data-import-fill]');
+  fill.classList.toggle('is-indeterminate', ['processing', 'converting'].includes(status));
+  fill.classList.toggle('is-converting', status === 'converting');
+  const progressWidth = status === 'complete' ? 100 :
+    status === 'uploading' && percent !== null ? file.percent :
+      ['processing', 'converting'].includes(status) ? 34 : 0;
+  const gsap = window.gsap;
+  if (gsap && !window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    gsap.to(fill, { width: `${progressWidth}%`, duration: 0.35, ease: 'power2.out' });
+  } else {
+    fill.style.width = `${progressWidth}%`;
+  }
+  const completed = importQueue.filter(item => ['complete', 'error'].includes(item.status)).length;
+  importCount.textContent = `${completed} / ${importQueue.length}`;
+}
+
+function hideImportProgress() {
+  importProgress.setAttribute('aria-busy', 'false');
+  const gsap = window.gsap;
+  if (gsap && !window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    gsap.to(importProgress, {
+      autoAlpha: 0,
+      y: 14,
+      duration: 0.22,
+      onComplete: () => importProgress.classList.add('hidden')
+    });
+  } else {
+    importProgress.classList.add('hidden');
+  }
+}
+
+function showToast(message, duration = 2400) {
   const toast = document.querySelector('#toast');
   toast.textContent = message;
   toast.classList.add('show');
-  setTimeout(() => toast.classList.remove('show'), 2400);
+  setTimeout(() => toast.classList.remove('show'), duration);
 }
 
 async function loadFiles(files) {
-  const supportedFiles = [...files].filter(file => file.type === 'application/pdf' || /\.pdf$/i.test(file.name) || /^image\/(?:png|jpeg|jpg|webp)$/i.test(file.type));
-  if (!supportedFiles.length) return showToast('Choose PDF, PNG, JPG, or WebP files');
-  for (const file of supportedFiles) {
-    try {
-      if (/\.pdf$/i.test(file.name) || file.type === 'application/pdf') {
-        const bytes = await file.arrayBuffer();
-        const pdf = await PDFDocument.load(bytes.slice(0));
-        const sourceId = ++state.fileCounter;
-        state.documents.push({ id: sourceId, name: file.name, bytes: bytes.slice(0), pdf });
-        for (let index = 0; index < pdf.getPageCount(); index++) state.pages.push({ id: crypto.randomUUID(), sourceId, sourceIndex: index, rotation: 0 });
-      } else {
-        const imageDataUrl = await imageFileToDataUrl(file);
-        const imageBytes = await fetch(imageDataUrl).then(response => response.arrayBuffer());
-        const output = await PDFDocument.create();
-        const image = imageDataUrl.startsWith('data:image/png') ? await output.embedPng(imageBytes) : await output.embedJpg(imageBytes);
-        const page = output.addPage([image.width, image.height]);
-        page.drawImage(image, { x: 0, y: 0, width: image.width, height: image.height });
-        const bytes = await output.save();
-        const sourceId = ++state.fileCounter;
-        const pdf = await PDFDocument.load(bytes.slice(0));
-        state.documents.push({ id: sourceId, name: file.name, bytes: bytes.slice(0), pdf });
-        state.pages.push({ id: crypto.randomUUID(), sourceId, sourceIndex: 0, rotation: 0 });
+  const selectedInOrder = Array.from(files);
+  const supportedFiles = selectedInOrder.filter(file => file.type === 'application/pdf' || /\.pdf$/i.test(file.name) || /\.docx$/i.test(file.name) || /^image\/(?:png|jpeg|jpg|webp)$/i.test(file.type));
+  if (!supportedFiles.length) return showToast('Choose PDF, DOCX, PNG, JPG, or WebP files');
+  renderImportQueue(supportedFiles);
+  importProgress.setAttribute('aria-busy', 'false');
+  await new Promise(resolve => {
+    startImport = resolve;
+  });
+  importProgress.setAttribute('aria-busy', 'true');
+  startImportButton.disabled = true;
+  startImportButton.textContent = 'Importing files…';
+  importFilesElement.querySelectorAll('.import-order-button').forEach(button => { button.disabled = true; });
+  try {
+    for (const [fileIndex, queuedFile] of importQueue.entries()) {
+      const file = queuedFile.file;
+      try {
+        updateImportFile(fileIndex, 'processing', 'Reading locally', null);
+        if (/\.pdf$/i.test(file.name) || file.type === 'application/pdf') {
+          const bytes = await file.arrayBuffer();
+          const pdf = await PDFDocument.load(bytes.slice(0));
+          const sourceId = ++state.fileCounter;
+          state.documents.push({ id: sourceId, name: file.name, bytes: bytes.slice(0), pdf });
+          for (let index = 0; index < pdf.getPageCount(); index++) state.pages.push({ id: crypto.randomUUID(), sourceId, sourceIndex: index, rotation: 0 });
+        } else if (/\.docx$/i.test(file.name)) {
+          const originalBytes = await file.arrayBuffer();
+          const bytes = await docxFileToPdf(originalBytes, file.name, fileIndex);
+          const pdf = await PDFDocument.load(bytes.slice(0));
+          const sourceId = ++state.fileCounter;
+          state.documents.push({ id: sourceId, name: file.name, bytes: bytes.slice(0), pdf, originalDocxBytes: originalBytes });
+          for (let index = 0; index < pdf.getPageCount(); index++) state.pages.push({ id: crypto.randomUUID(), sourceId, sourceIndex: index, rotation: 0 });
+        } else {
+          const imageDataUrl = await imageFileToDataUrl(file);
+          const imageBytes = await fetch(imageDataUrl).then(response => response.arrayBuffer());
+          const output = await PDFDocument.create();
+          const image = imageDataUrl.startsWith('data:image/png') ? await output.embedPng(imageBytes) : await output.embedJpg(imageBytes);
+          const page = output.addPage([image.width, image.height]);
+          page.drawImage(image, { x: 0, y: 0, width: image.width, height: image.height });
+          const bytes = await output.save();
+          const sourceId = ++state.fileCounter;
+          const pdf = await PDFDocument.load(bytes.slice(0));
+          state.documents.push({ id: sourceId, name: file.name, bytes: bytes.slice(0), pdf });
+          state.pages.push({ id: crypto.randomUUID(), sourceId, sourceIndex: 0, rotation: 0 });
+        }
+        updateImportFile(fileIndex, 'complete', 'Ready', 100);
+      } catch (error) {
+        updateImportFile(fileIndex, 'error', 'Could not import', 100);
+        const message = `Could not open ${file.name}: ${error instanceof Error ? error.message : 'unsupported or invalid file'}`;
+        showToast(message, /\.docx$/i.test(file.name) ? 6000 : 2400);
+        console.error(error);
       }
-    } catch (error) {
-      showToast(`Could not open ${file.name}`);
-      console.error(error);
     }
+  } finally {
+    hideImportProgress();
+    startImportButton.disabled = false;
+    startImportButton.textContent = 'Start import';
+    startImport = null;
   }
+  if (!state.pages.length) return;
   hero.classList.add('hidden');
   workspace.classList.remove('hidden');
   renderPages();
+}
+
+async function docxFileToPdf(originalBytes, fileName, fileIndex) {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open('POST', '/api/docx-to-pdf');
+    request.responseType = 'arraybuffer';
+    request.setRequestHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+    updateImportFile(fileIndex, 'uploading', 'Uploading', 0);
+    request.upload.addEventListener('progress', event => {
+      if (!event.lengthComputable) {
+        updateImportFile(fileIndex, 'uploading', 'Uploading', 0);
+        return;
+      }
+      updateImportFile(fileIndex, 'uploading', 'Uploading', Math.round(event.loaded / event.total * 100));
+    });
+    request.upload.addEventListener('load', () => {
+      updateImportFile(fileIndex, 'converting', 'Converting locally');
+    });
+    request.addEventListener('load', () => {
+      if (request.status >= 200 && request.status < 300) {
+        resolve(request.response);
+        return;
+      }
+      let message = request.status === 404
+        ? 'DOCX conversion service is unavailable. Restart the PDF Studio server with npm run dev.'
+        : `DOCX conversion failed (HTTP ${request.status}).`;
+      try {
+        const response = JSON.parse(new TextDecoder().decode(request.response));
+        if (response.error) message = response.error;
+      } catch (error) {
+        console.error('Could not read the DOCX conversion error response.', error);
+      }
+      reject(new Error(message));
+    });
+    request.addEventListener('error', () => reject(new Error('Could not connect to the local DOCX conversion service.')));
+    request.addEventListener('abort', () => reject(new Error('DOCX conversion was cancelled.')));
+    request.send(originalBytes);
+  });
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, character => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  })[character]);
 }
 
 async function renderThumbnail(page) {
@@ -152,8 +379,8 @@ function renderPages() {
   pagesElement.innerHTML = state.pages.map((page, position) => {
     const source = state.documents.find(document => document.id === page.sourceId);
     const selected = state.selected.has(page.id) ? ' selected' : '';
-    return `<article class="page-card${selected}" draggable="true" data-page-id="${page.id}">
-      <button class="select-check" aria-label="Select page">${state.selected.has(page.id) ? '✓' : ''}</button>
+    return `<article class="page-card${selected}" draggable="true" data-page-id="${page.id}" data-source-page="${page.sourceIndex + 1}">
+      <button class="select-check" aria-label="${state.selected.has(page.id) ? 'Deselect' : 'Select'} page ${page.sourceIndex + 1}" aria-pressed="${state.selected.has(page.id)}">${state.selected.has(page.id) ? '✓' : ''}</button>
       <span class="page-order">${position + 1}</span>
       <canvas data-thumbnail="${page.id}"></canvas>
       <div class="page-meta"><strong>Page ${page.sourceIndex + 1}</strong><span>${source.name}</span></div>
@@ -162,6 +389,7 @@ function renderPages() {
   document.querySelector('#summary').textContent = `${state.pages.length} pages · ${state.documents.length} files`;
   state.pages.forEach(renderThumbnail);
   bindPageEvents();
+  updatePageSelectionUI();
 }
 
 function bindPageEvents() {
@@ -193,7 +421,24 @@ function bindPageEvents() {
 
 function toggleSelection(id) {
   state.selected.has(id) ? state.selected.delete(id) : state.selected.add(id);
-  renderPages();
+  updatePageSelectionUI();
+}
+
+function updatePageSelectionUI() {
+  pagesElement.querySelectorAll('.page-card').forEach(card => {
+    const selected = state.selected.has(card.dataset.pageId);
+    card.classList.toggle('selected', selected);
+    const checkbox = card.querySelector('.select-check');
+    if (checkbox) {
+      checkbox.textContent = selected ? '✓' : '';
+      checkbox.setAttribute('aria-pressed', String(selected));
+      checkbox.setAttribute('aria-label', `${selected ? 'Deselect' : 'Select'} page ${card.dataset.sourcePage}`);
+    }
+  });
+  const allSelected = state.pages.length > 0 && state.pages.every(page => state.selected.has(page.id));
+  const selectAllButton = document.querySelector('#selectAllPages');
+  selectAllButton.textContent = allSelected ? 'Clear selection' : 'Select all';
+  selectAllButton.setAttribute('aria-pressed', String(allSelected));
 }
 
 function selectedPages() {
@@ -201,10 +446,10 @@ function selectedPages() {
   return pages.length ? pages : [];
 }
 
-async function newPdfFromPages(pagesToCopy, crop) {
+async function newPdfFromPages(pagesToCopy, crop, onPageCopied) {
   const output = await PDFDocument.create();
   const cache = new Map();
-  for (const page of pagesToCopy) {
+  for (const [index, page] of pagesToCopy.entries()) {
     let source = cache.get(page.sourceId);
     if (!source) {
       const document = state.documents.find(item => item.id === page.sourceId);
@@ -214,6 +459,7 @@ async function newPdfFromPages(pagesToCopy, crop) {
     const [copied] = await output.copyPages(source, [page.sourceIndex]);
     copied.setRotation(degrees((copied.getRotation().angle + page.rotation) % 360));
     output.addPage(copied);
+    onPageCopied?.(index + 1, pagesToCopy.length);
   }
   if (crop) {
     output.getPages().forEach(page => {
@@ -230,9 +476,50 @@ async function newPdfFromPages(pagesToCopy, crop) {
   return output;
 }
 
-async function downloadPdf(output, name) {
-  const bytes = await output.save({ useObjectStreams: true, addDefaultPage: false });
-  const url = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
+function showDownloadProgress(name) {
+  clearTimeout(downloadHideTimer);
+  downloadProgressTitle.textContent = 'Preparing download';
+  downloadProgressDetail.textContent = `${name} is being prepared on this device`;
+  downloadProgressValue.textContent = 'Preparing';
+  downloadProgressTrack.removeAttribute('aria-valuenow');
+  downloadProgressTrack.setAttribute('aria-valuetext', 'Preparing download');
+  downloadProgressFill.classList.add('is-indeterminate');
+  downloadProgressFill.style.width = '';
+  downloadProgress.classList.remove('hidden');
+}
+
+function updateDownloadPageProgress(name, completedPages, totalPages) {
+  const percent = Math.round(completedPages / totalPages * 100);
+  downloadProgressDetail.textContent = `Preparing ${name} · page ${completedPages} of ${totalPages}`;
+  downloadProgressValue.textContent = `${percent}%`;
+  downloadProgressTrack.setAttribute('aria-valuenow', String(percent));
+  downloadProgressTrack.setAttribute('aria-valuetext', `${completedPages} of ${totalPages} pages prepared`);
+  downloadProgressFill.classList.remove('is-indeterminate');
+  downloadProgressFill.style.width = `${percent}%`;
+}
+
+function finalizeDownloadProgress(name) {
+  downloadProgressDetail.textContent = `${name} is being finalized on this device`;
+  downloadProgressValue.textContent = 'Finalizing';
+  downloadProgressTrack.removeAttribute('aria-valuenow');
+  downloadProgressTrack.setAttribute('aria-valuetext', 'Finalizing download');
+  downloadProgressFill.classList.add('is-indeterminate');
+  downloadProgressFill.style.width = '';
+}
+
+function completeDownloadProgress(name) {
+  downloadProgressTitle.textContent = 'Download started';
+  downloadProgressDetail.textContent = `${name} was handed to your browser`;
+  downloadProgressValue.textContent = 'Ready';
+  downloadProgressTrack.setAttribute('aria-valuenow', '100');
+  downloadProgressTrack.setAttribute('aria-valuetext', 'Download started');
+  downloadProgressFill.classList.remove('is-indeterminate');
+  downloadProgressFill.style.width = '100%';
+  downloadHideTimer = setTimeout(() => downloadProgress.classList.add('hidden'), 2200);
+}
+
+function triggerDownload(blob, name) {
+  const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
   link.href = url;
   link.download = name;
@@ -240,11 +527,27 @@ async function downloadPdf(output, name) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+async function downloadPdf(output, name, progressStarted = false) {
+  if (progressStarted) finalizeDownloadProgress(name);
+  else showDownloadProgress(name);
+  try {
+    const bytes = await output.save({ useObjectStreams: true, addDefaultPage: false });
+    triggerDownload(new Blob([bytes], { type: 'application/pdf' }), name);
+    completeDownloadProgress(name);
+  } catch (error) {
+    clearTimeout(downloadHideTimer);
+    downloadProgress.classList.add('hidden');
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    showToast(`Could not prepare ${name}: ${message}`, 6000);
+    console.error(error);
+    throw error;
+  }
+}
+
 function downloadBlob(blob, name) {
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = url; link.download = name; link.click();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  showDownloadProgress(name);
+  triggerDownload(blob, name);
+  completeDownloadProgress(name);
 }
 
 function selectedSource() {
@@ -314,23 +617,44 @@ async function act(action) {
 
 document.querySelector('#chooseFiles').addEventListener('click', () => fileInput.click());
 document.querySelector('#addFiles')?.addEventListener('click', () => fileInput.click());
+startImportButton.addEventListener('click', () => startImport?.());
+importFilesElement.addEventListener('click', event => {
+  const button = event.target.closest('[data-move-import]');
+  if (!button || importProgress.getAttribute('aria-busy') === 'true') return;
+  moveImportFile(Number(button.closest('[data-import-file]').dataset.importFile), Number(button.dataset.moveImport));
+});
 document.querySelector('#selectAllPages').addEventListener('click', () => {
   const allSelected = state.pages.length > 0 && state.pages.every(page => state.selected.has(page.id));
   state.selected = allSelected ? new Set() : new Set(state.pages.map(page => page.id));
-  document.querySelector('#selectAllPages').textContent = allSelected ? 'Select all' : 'Clear selection';
-  renderPages(); showToast(allSelected ? 'Selection cleared' : 'All pages selected');
+  updatePageSelectionUI();
+  showToast(allSelected ? 'Selection cleared' : 'All pages selected');
 });
 document.querySelector('#downloadPdf').addEventListener('click', async () => {
   const pagesToDownload = selectedPages().length ? selectedPages() : state.pages;
   if (!pagesToDownload.length) return showToast('Add a PDF or images first');
-  const output = await newPdfFromPages(pagesToDownload);
-  await downloadPdf(output, 'pdf-studio-download.pdf'); showToast('PDF downloaded');
+  const name = 'pdf-studio-download.pdf';
+  showDownloadProgress(name);
+  try {
+    const output = await newPdfFromPages(pagesToDownload, undefined, (completed, total) => {
+      updateDownloadPageProgress(name, completed, total);
+    });
+    await downloadPdf(output, name, true);
+    showToast('PDF downloaded');
+  } catch (error) {
+    if (!downloadProgress.classList.contains('hidden')) {
+      clearTimeout(downloadHideTimer);
+      downloadProgress.classList.add('hidden');
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      showToast(`Could not prepare ${name}: ${message}`, 6000);
+      console.error(error);
+    }
+  }
 });
 document.querySelector('#clearFiles').addEventListener('click', () => {
   state.documents = []; state.pages = []; state.selected.clear(); state.fileCounter = 0;
   workspace.classList.add('hidden'); hero.classList.remove('hidden');
 });
-fileInput.addEventListener('change', () => { loadFiles(fileInput.files); fileInput.value = ''; });
+fileInput.addEventListener('change', () => { queueFiles(fileInput.files); fileInput.value = ''; });
 document.querySelectorAll('[data-action]').forEach(button => button.addEventListener('click', () => act(button.dataset.action)));
 
 const imagePdfInput = document.querySelector('#imagePdfInput');
@@ -482,7 +806,7 @@ for (const target of [hero, document.body]) {
   target.addEventListener('dragover', event => { event.preventDefault(); hero.classList.add('dragover'); });
   target.addEventListener('dragleave', () => hero.classList.remove('dragover'));
 }
-document.body.addEventListener('drop', event => { event.preventDefault(); hero.classList.remove('dragover'); loadFiles(event.dataTransfer.files); });
+document.body.addEventListener('drop', event => { event.preventDefault(); hero.classList.remove('dragover'); queueFiles(event.dataTransfer.files); });
 
 const cropDialog = document.querySelector('#cropDialog');
 document.querySelector('[data-action="crop"]').addEventListener('click', () => {
